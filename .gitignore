@@ -1,3 +1,5 @@
 *.har
 !*.SANITIZED.har
 *.REPORT.txt
+__pycache__/
+.env

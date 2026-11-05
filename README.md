@@ -1,13 +1,13 @@
 # Anti-Bot HAR Check
 
-A small, dependency-free tool to verify the **Anti-Bot configuration of your web application** (e.g. Check Point CloudGuard WAF) from a browser traffic capture (`.har` file).
+A small, dependency-free tool that takes a browser capture (`.har` file) of a **login** to your web application and tells you which **Injected URIs** and **Validated URIs** to configure in the Check Point CloudGuard WAF **Anti-Bot** practice.
 
 It does two things:
 
 1. **Sanitizes** your capture — removes cookies, authentication headers, tokens, passwords and any binary content, so the file is **safe to share** with your security team.
 2. **Analyzes** the sanitized capture and produces a report with:
-   - The HTML pages where the anti-bot JavaScript sensor should be injected (*Injected URIs*)
-   - The endpoints that should be validated (*Validated URIs*), highlighting probable login forms
+   - The login/registration pages (GET) where the anti-bot JavaScript sensor must be injected (*Injected URIs*)
+   - The login/registration submissions (POST) that must be validated (*Validated URIs*)
    - Whether an anti-bot sensor is **already present** in your pages
 
 **Your original capture never leaves your machine.** You only share the sanitized copy and the report.
@@ -102,25 +102,47 @@ Send the **sanitized HAR** and the **report** to your security contact.
 
 ### How to read the report
 
-- **HTML DOCUMENTS (candidates for INJECTED URIs)** — full pages your browser navigated to. These are where the WAF should inject the JS sensor. `[!] empty body in HAR` means the browser didn't record that response body — re-capture with *Preserve log* enabled if sensor verification is needed on that page.
-- **POST/PUT/DELETE (candidates for VALIDATED URIs)** — endpoints receiving user actions. Lines marked `** possible LOGIN **` are the typical targets of credential-stuffing bots and the priority for validation.
-- **HTML FRAGMENTS via XHR** — partial content loaded by JavaScript. These should **not** be configured as Injected URIs.
-- **REDIRECTS** — useful to spot lowercase/uppercase URL variants that need separate WAF entries.
-- **SCRIPTS REFERENCED IN HTML (sensor detection)** — the final `RESULT` line tells you whether an anti-bot sensor is already being injected into your pages. Use this to verify the configuration *after* it has been applied: capture a new HAR, run the tool again, and the result should change to *sensor IS present*.
+The report starts with the **recommended Anti-Bot practice values**. They are relative URIs (no domain), which is the format the *Injected URIs* and *Validated URIs* tables expect:
 
----
+- **INJECTED URIs**: the login/registration pages, loaded with GET. The WAF injects the JS sensor into these responses. The tool picks the page whose `<form>` posts to a Validated URI, the page that sent the login (`Referer`), or any page with a password field. For a SPA it picks the document that loads the app.
+- **VALIDATED URIs**: the login/registration submissions, sent with POST. The WAF checks the sensor output on these requests. A POST counts as a login when it sends a password field (form, JSON or multipart). The evidence lines show which fields were found, whether it was a form submit or an XHR/fetch call, and the response (for example `302 -> /portal`).
+- **NOTES**: warnings to act on. For example: the login was not captured, the login page GET is missing, credentials go to another host, or there is an SSO redirect to an external identity provider, which this WAF asset does not protect.
+
+Each Injected URI also lists any **case variants** and **redirects** that lead to it (for example `/app/default.aspx` → `/app/Default.aspx`). Add those variants as well.
+
+The **DETAILS** section has the rest:
+
+- **HTML DOCUMENTS**: every page that was navigated to.
+- **OTHER POST…**: endpoints that are not a login, such as AJAX callbacks and telemetry. They are normally *not* Validated URIs.
+- **REDIRECTS**: the redirects seen in the capture.
+- **ANTI-BOT SENSOR DETECTION**: script URLs, inline loaders and vendor cookies of known bot-management sensors. The final `RESULT` line tells you whether a sensor is already present. To verify a configuration once it has been applied, capture a new HAR and run the tool again.
+
+Use `--verbose` to also list every script, every posted field name and the XHR GET calls.
 
 ## What exactly gets sanitized?
 
+Field and parameter **names** are kept (they are needed for the analysis); **values** are replaced with `[REDACTED]`.
+
 - All **cookies** (request and response)
-- **Authorization**, API-key and CSRF/session **headers**
-- **Passwords, usernames, emails, tokens** and similar values in submitted forms and JSON bodies (field *names* are kept — they are needed for the analysis; field *values* are replaced with `[REDACTED]`)
-- Sensitive **query-string parameters**
-- All **binary response bodies** (images, fonts, downloads). HTML/JS/CSS/JSON responses are kept because they are required to detect the injected sensor.
+- **Authorization**, API-key, CSRF/session and any other token/auth/secret **headers**
+- **Every query-string and URL-fragment value**, in request URLs, redirects, `Location` and `Referer` headers (e.g. OAuth `code`, `access_token`)
+- **Every value** in submitted forms, JSON bodies and multipart uploads (file names included)
+- **JSON responses**: keys kept, all values redacted (login responses often contain tokens)
+- **HTML responses**: reduced to a skeleton — `<script>` tags, `<form>` tags and input names. Page text, hidden-field values (CSRF, `__VIEWSTATE`) and string literals in inline scripts (except URLs/paths) are removed
+- All **binary and other response bodies** (images, fonts, downloads, XML, text). JS/CSS responses are kept because they are required to detect the injected sensor
+- WebSocket message contents and browser call stacks (`_initiator`)
 
 The sanitized file is marked internally (`_sanitized: true`) so downstream tooling can verify it went through this process.
 
 ---
+
+## Development
+
+Run the tests (standard library only):
+
+```bash
+python3 -m unittest discover tests
+```
 
 ## Privacy
 
