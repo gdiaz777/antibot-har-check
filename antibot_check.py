@@ -1,38 +1,197 @@
 #!/usr/bin/env python3
 """
-antibot_check.py — CloudGuard WAF Anti-Bot HAR checker
+antibot_check.py — find the CloudGuard WAF Anti-Bot URIs in a HAR capture
 
-A self-contained, dependency-free tool that:
-  1. SANITIZES a browser HAR capture (removes cookies, auth headers, tokens,
-     credentials and binary bodies) so it is safe to share with your
-     security team.
-  2. ANALYZES the sanitized capture to check the Anti-Bot configuration:
-       - Which HTML pages should have the JS sensor injected ("Injected URIs")
-       - Which endpoints should be validated ("Validated URIs")
-       - Whether an anti-bot sensor is ALREADY present in the pages
+Capture a HAR while you open the login page, log in and land on the
+authenticated page. The tool prints the two lists the Anti-Bot practice
+needs, as relative URIs:
 
-Requirements: Python 3.8+ (standard library only — no pip install needed).
-Works on Windows, macOS and Linux.
+  Injected URIs   the login/registration pages (GET)
+  Validated URIs  the login/registration submissions (POST)
+
+or why it could not recognize the login.
+
+Requirements: Python 3.8+ (standard library only). Windows, macOS, Linux.
 
 Usage:
     python antibot_check.py capture.har
-    python antibot_check.py capture.har --host portal.example.com
+    python antibot_check.py capture.har --sanitize   # also write a safe copy
 
-Output (created next to the input file):
-    capture.SANITIZED.har   -> safe-to-share copy (send THIS one, never the original)
-    capture.REPORT.txt      -> human-readable analysis report
+Exit codes: 0 = URIs found, 2 = login not recognized, 1 = error.
 """
 
 import argparse
+import base64
+import binascii
 import json
 import re
 import sys
-from collections import Counter
 from pathlib import Path
-from urllib.parse import urlparse
+from typing import List, Optional, Tuple
+from urllib.parse import (parse_qsl, unquote_plus, urlencode, urljoin,
+                          urlparse, urlunparse)
 
 # --------------------------------------------------------------------------
-# Sanitization settings
+# Login detection
+# --------------------------------------------------------------------------
+
+# Field names that hold a password (login, registration, password change)
+PASSWORD_FIELDS = re.compile(
+    r'(pass|pwd|contrase|senha|clave|passwort|mot_?de_?passe|wachtwoord)',
+    re.I)
+
+
+def _header(req_or_resp: dict, name: str) -> str:
+    for h in req_or_resp.get('headers', []):
+        if h.get('name', '').lower() == name:
+            return h.get('value', '')
+    return ''
+
+
+def _decode_body(content: dict) -> str:
+    """Return the response body as text, decoding base64 if needed."""
+    text = content.get('text') or ''
+    if text and content.get('encoding') == 'base64':
+        try:
+            return base64.b64decode(text).decode('utf-8', 'replace')
+        except (binascii.Error, ValueError):
+            return ''
+    return text
+
+
+def _location(url: str) -> Tuple[str, str]:
+    """(host, path) of a URL: host without port, path as the WAF sees it."""
+    u = urlparse(url)
+    return (u.hostname or '').lower(), u.path or '/'
+
+
+def _attr(tag: str, name: str) -> Optional[str]:
+    m = re.search(r'(?:^|\s)' + name + r'\s*=\s*(["\'])(.*?)\1', tag,
+                  re.I | re.S)
+    return m.group(2).replace('&amp;', '&') if m else None
+
+
+def _short(field: str) -> str:
+    """Last segment of a framework-generated name (ctl00$Panel$txtUser)."""
+    return re.split(r'[$.:]', field)[-1] or field
+
+
+def _json_keys(obj, prefix: str = '') -> List[str]:
+    keys = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            keys.append(prefix + k)
+            keys.extend(_json_keys(v, prefix + k + '.'))
+    elif isinstance(obj, list) and obj:
+        keys.extend(_json_keys(obj[0], prefix))
+    return keys
+
+
+def _post_fields(pd: dict) -> List[str]:
+    """Field names of a request body (form, multipart or JSON)."""
+    fields = [unquote_plus(p.get('name', '')) for p in pd.get('params', [])]
+    text = pd.get('text') or ''
+    if fields or not text:
+        return fields
+    if 'multipart' in pd.get('mimeType', ''):
+        return re.findall(r'name="([^"]*)"', text)
+    if 'json' in pd.get('mimeType', '') or text.lstrip().startswith(('{', '[')):
+        try:
+            return _json_keys(json.loads(text))
+        except ValueError:
+            return []
+    return [k for k, _ in parse_qsl(text, keep_blank_values=True)]
+
+
+def find_uris(har: dict):
+    """Return (injected, validated, reason).
+
+    injected / validated are lists of (host, path) in capture order; reason
+    explains why the login was not recognized (None when it was).
+    """
+    pages = {}          # (host, path) -> form actions and password inputs
+    logins = []         # POSTs that submit a password
+    last_page = None
+
+    for e in har['log']['entries']:
+        req, resp = e.get('request', {}), e.get('response', {})
+        method = req.get('method', '').upper()
+        loc = _location(req.get('url', ''))
+        dest = _header(req, 'sec-fetch-dest')
+        xhr = bool(_header(req, 'x-requested-with')) or dest == 'empty'
+
+        if method == 'GET' and not xhr and \
+                'html' in resp.get('content', {}).get('mimeType', '') and \
+                dest in ('', 'document', 'iframe') and \
+                not 300 <= resp.get('status', 0) < 400:
+            page = pages.setdefault(loc, {'actions': set(),
+                                          'passwords': set()})
+            last_page = loc
+            body = _decode_body(resp.get('content', {}))
+            for m in re.finditer(r'<form\b[^>]*>', body, re.I):
+                action = _attr(m.group(0), 'action')
+                page['actions'].add(_location(urljoin(req['url'], action))
+                                    if action else loc)
+            for m in re.finditer(r'<input\b[^>]*>', body, re.I):
+                if (_attr(m.group(0), 'type') or '').lower() == 'password':
+                    page['passwords'].add(_attr(m.group(0), 'name') or '')
+
+        if method == 'POST' and req.get('postData'):
+            fields = _post_fields(req['postData'])
+            referer = _header(req, 'referer')
+            logins.append({'loc': loc, 'fields': fields,
+                           'referer': _location(referer) if referer else None,
+                           'last_page': last_page})
+
+    password_inputs = set()
+    for page in pages.values():
+        password_inputs |= page['passwords']
+    logins = [p for p in logins
+              if any(f in password_inputs or PASSWORD_FIELDS.search(_short(f))
+                     for f in p['fields'])]
+    if not logins:
+        return [], [], ('no request in the capture submits a password field. '
+                        'Capture the login submission with "Preserve log" '
+                        'enabled.')
+
+    validated = list(dict.fromkeys(p['loc'] for p in logins))
+    injected = []
+    for post in logins:
+        found = [loc for loc, page in pages.items()
+                 if post['loc'] in page['actions'] and page['passwords']]
+        if not found and post['referer'] in pages:
+            found = [post['referer']]
+        if not found and post['last_page']:
+            # SPA: the Referer is a client-side route, not a loaded page
+            found = [post['last_page']]
+        injected.extend(found)
+    injected = list(dict.fromkeys(injected))
+    if not injected:
+        return [], validated, ('the login page itself (GET) is not in the '
+                               'capture. Start recording before opening the '
+                               'login page.')
+    return injected, validated, None
+
+
+def report(injected, validated, reason) -> str:
+    hosts = {h for h, _ in injected + validated}
+
+    def fmt(locs):
+        return '\n'.join(f'  {f"{h} " if len(hosts) > 1 else ""}{p}'
+                         for h, p in locs)
+
+    lines = []
+    if injected:
+        lines += ['Injected URIs:', fmt(injected), '']
+    if validated:
+        lines += ['Validated URIs:', fmt(validated), '']
+    if reason:
+        lines.append(f'Could not identify the login: {reason}')
+    return '\n'.join(lines).rstrip()
+
+
+# --------------------------------------------------------------------------
+# Optional: sanitized copy (--sanitize)
 # --------------------------------------------------------------------------
 
 # Headers whose values are always redacted (request and response)
@@ -42,218 +201,137 @@ SENSITIVE_HEADERS = {
     'x-amz-security-token', 'x-goog-authuser',
 }
 
-# Field/parameter names that indicate sensitive values (values are redacted,
-# names are kept — they are needed to identify login forms)
-SENSITIVE_PARAMS = re.compile(
-    r'(pass|pwd|senha|token|session|sess|auth|secret|key|user|login|email|'
-    r'mail|nif|dni|nie|cc|iban|card|phone|tel|otp|pin|code)', re.I)
+# Any other header whose name contains one of these words is redacted too
+SENSITIVE_HEADER_WORDS = re.compile(
+    r'(token|auth|secret|session|csrf|xsrf|key|cookie|signature|'
+    r'credential|password|jwt)', re.I)
 
-# Response bodies to KEEP (needed to detect the injected sensor);
-# everything else (images, fonts, downloads...) is stripped
-KEEP_MIMES = ('html', 'javascript', 'json', 'xml', 'css')
+# Headers that carry full URLs: their query string / fragment is redacted
+URL_HEADERS = {'referer', 'location', 'content-location', 'refresh',
+               ':path'}
 
 REDACTED = '[REDACTED]'
 
-# Signatures of known anti-bot / bot-management sensors
-KNOWN_SENSORS = re.compile(
-    r'(cloudguard|checkpoint|/cp-|appsec|perimeterx|px-cdn|datadome|'
-    r'imperva|incapsula|akamai.*bmp|_bm/|kasada|shape|f5.*bot|recaptcha|'
-    r'hcaptcha|turnstile)', re.I)
+
+def _redact_query(qs: str) -> str:
+    """Keep parameter names, redact every value."""
+    if not qs:
+        return qs
+    pairs = parse_qsl(qs, keep_blank_values=True)
+    if not pairs:
+        return REDACTED
+    return urlencode([(k, REDACTED) for k, _ in pairs], safe='[]')
 
 
-# --------------------------------------------------------------------------
-# Step 1 — Sanitize
-# --------------------------------------------------------------------------
+def _redact_url(url: str) -> str:
+    """Redact query-string and fragment values, keep scheme/host/path."""
+    try:
+        u = urlparse(url)
+    except ValueError:
+        return REDACTED
+    if not (u.query or u.fragment or u.username or u.password):
+        return url
+    netloc = u.netloc.rsplit('@', 1)[-1]
+    return urlunparse(u._replace(netloc=netloc, query=_redact_query(u.query),
+                                 fragment=_redact_query(u.fragment)))
 
-def sanitize(har: dict) -> dict:
-    """Redact sensitive data in-place. Returns redaction statistics."""
-    stats = {'headers': 0, 'cookies': 0, 'query_params': 0,
-             'post_fields': 0, 'response_bodies_removed': 0}
+
+def _redact_json(obj):
+    """Recursively replace every scalar value, keep keys and structure."""
+    if isinstance(obj, dict):
+        return {k: _redact_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_json(v) for v in obj]
+    if obj is None or isinstance(obj, bool):
+        return obj
+    return REDACTED
+
+
+def _html_skeleton(doc: str) -> str:
+    """Keep only what the analysis reads: <form> tags (action redacted) and
+    input fields (values redacted). Page text and scripts are dropped."""
+    out = []
+    for m in re.finditer(r'<form\b[^>]*>', doc, re.I):
+        out.append(re.sub(r'\baction\s*=\s*(["\'])([^"\']*)\1',
+                          lambda a: f'action={a.group(1)}'
+                                    f'{_redact_url(a.group(2))}{a.group(1)}',
+                          m.group(0), flags=re.I))
+    for m in re.finditer(r'<(input|textarea|select)\b[^>]*>', doc, re.I):
+        out.append(re.sub(r'\bvalue\s*=\s*(["\'])[^"\']*\1',
+                          f'value="{REDACTED}"', m.group(0), flags=re.I))
+    return '\n'.join(out)
+
+
+def _sanitize_post(pd: dict) -> None:
+    for p in pd.get('params', []):
+        p['value'] = REDACTED
+        if p.get('fileName'):
+            p['fileName'] = REDACTED
+    text = pd.get('text')
+    if not text:
+        return
+    ctype = pd.get('mimeType', '').lower()
+    stripped = text.lstrip()
+    if 'json' in ctype or stripped.startswith(('{', '[')):
+        try:
+            pd['text'] = json.dumps(_redact_json(json.loads(text)))
+        except ValueError:
+            pd['text'] = f'[BODY REDACTED - {ctype} - {len(text)} bytes]'
+    elif 'multipart' in ctype:
+        names = re.findall(r'name="([^"]*)"', text)
+        if names and not pd.get('params'):
+            pd['params'] = [{'name': n, 'value': REDACTED} for n in names]
+        pd['text'] = ''.join(f'name="{n}"\n' for n in names)
+    elif 'x-www-form-urlencoded' in ctype or \
+            re.match(r'^[\w.\-\[\]%]+=', stripped):
+        pd['text'] = _redact_query(text)
+    else:
+        pd['text'] = f'[BODY REDACTED - {ctype} - {len(text)} bytes]'
+
+
+def sanitize(har: dict) -> None:
+    """Redact sensitive data in place. Field names, paths and form structure
+    are kept, so the sanitized copy gives the same result."""
+    for page in har['log'].get('pages', []):
+        if '://' in page.get('title', ''):
+            page['title'] = _redact_url(page['title'])
 
     for entry in har['log']['entries']:
-        req, resp = entry['request'], entry['response']
+        req, resp = entry.get('request', {}), entry.get('response', {})
 
-        # Sensitive headers and all cookie values, on both sides
         for side in (req, resp):
             for h in side.get('headers', []):
-                if h['name'].lower() in SENSITIVE_HEADERS:
+                name = h.get('name', '').lower()
+                if name in SENSITIVE_HEADERS or \
+                        SENSITIVE_HEADER_WORDS.search(name):
                     h['value'] = REDACTED
-                    stats['headers'] += 1
+                elif name in URL_HEADERS:
+                    h['value'] = _redact_url(h.get('value', ''))
             for c in side.get('cookies', []):
                 c['value'] = REDACTED
-                stats['cookies'] += 1
 
-        # Sensitive query string parameters
+        for side, key in ((req, 'url'), (resp, 'redirectURL')):
+            if side.get(key):
+                side[key] = _redact_url(side[key])
         for p in req.get('queryString', []):
-            if SENSITIVE_PARAMS.search(p['name']):
-                p['value'] = REDACTED
-                stats['query_params'] += 1
+            p['value'] = REDACTED
+        if req.get('postData'):
+            _sanitize_post(req['postData'])
 
-        # POST bodies: redact values, keep field names
-        pd = req.get('postData')
-        if pd:
-            for p in pd.get('params', []):
-                if SENSITIVE_PARAMS.search(p.get('name', '')):
-                    p['value'] = REDACTED
-                    stats['post_fields'] += 1
-            text = pd.get('text', '')
-            if text and SENSITIVE_PARAMS.search(text):
-                if text.lstrip().startswith(('{', '[')):
-                    # JSON body: redact every string value
-                    pd['text'] = re.sub(r':\s*"[^"]*"', f': "{REDACTED}"', text)
-                else:
-                    # form-urlencoded: redact values, keep names
-                    pd['text'] = re.sub(r'=([^&\s]+)', '=' + REDACTED, text)
-                stats['post_fields'] += 1
+        entry.pop('_initiator', None)
+        for msg in entry.get('_webSocketMessages', []):
+            msg['data'] = REDACTED
 
-        # Strip response bodies we don't need for the analysis
+        # Response bodies: HTML reduced to forms and fields, the rest removed
         content = resp.get('content', {})
-        mime = content.get('mimeType', '')
-        if 'text' in content and not any(t in mime for t in KEEP_MIMES):
-            size = content.get('size', 0)
-            content['text'] = f'[BODY REMOVED - {mime} - {size} bytes]'
-            stats['response_bodies_removed'] += 1
+        if content.get('text'):
+            mime = content.get('mimeType', '').lower()
+            body = _decode_body(content)
+            content.pop('encoding', None)
+            content['text'] = _html_skeleton(body) if 'html' in mime else \
+                f'[BODY REMOVED - {mime} - {content.get("size", 0)} bytes]'
 
-    # Marker so downstream tooling can verify the file was sanitized
     har['log']['_sanitized'] = True
-    return stats
-
-
-# --------------------------------------------------------------------------
-# Step 2 — Analyze
-# --------------------------------------------------------------------------
-
-def _header(req_or_resp, name):
-    for h in req_or_resp.get('headers', []):
-        if h['name'].lower() == name:
-            return h['value']
-    return ''
-
-
-def _dedup(seq, key=lambda x: x[0]):
-    seen, out = set(), []
-    for item in seq:
-        if key(item) not in seen:
-            seen.add(key(item))
-            out.append(item)
-    return out
-
-
-def analyze(har: dict, host: str | None, out) -> None:
-    """Write the analysis report for one host to the `out` stream."""
-    entries = har['log']['entries']
-
-    hosts = Counter(urlparse(e['request']['url']).netloc for e in entries)
-    print('Hosts found in the capture:', file=out)
-    for h, c in hosts.most_common():
-        print(f'  {c:4d}  {h}', file=out)
-    target = host or hosts.most_common(1)[0][0]
-    print(f'\nAnalyzed host: {target}\n', file=out)
-
-    html_docs, fragments, posts, xhr_get = [], [], [], []
-    scripts, form_actions, redirects = [], set(), []
-
-    for e in entries:
-        req, resp = e['request'], e['response']
-        u = urlparse(req['url'])
-        if u.netloc != target:
-            continue
-        method = req['method']
-        status = resp['status']
-        mime = resp.get('content', {}).get('mimeType', '')
-        body = resp.get('content', {}).get('text', '') or ''
-        dest = _header(req, 'sec-fetch-dest')
-        xrw = _header(req, 'x-requested-with')
-        loc = _header(resp, 'location')
-
-        if loc:
-            redirects.append((status, u.path, loc))
-
-        if 'html' in mime and method == 'GET':
-            # Full document navigation vs. HTML fragment loaded via XHR
-            if dest == 'document' or (not dest and not xrw):
-                html_docs.append((u.path, status, len(body)))
-            else:
-                fragments.append((u.path, status))
-            for m in re.finditer(
-                    r'<script[^>]{0,300}src=["\']([^"\']+)["\']', body, re.I):
-                scripts.append((u.path, m.group(1)))
-            for m in re.finditer(
-                    r'<form[^>]+action=["\']([^"\']+)', body, re.I):
-                form_actions.add(f'form action -> {m.group(1)} (in {u.path})')
-
-        if method in ('POST', 'PUT', 'DELETE'):
-            pd = req.get('postData', {})
-            ctype = pd.get('mimeType', '')
-            fields = [p['name'] for p in pd.get('params', [])]
-            if not fields and pd.get('text'):
-                if pd['text'].lstrip().startswith(('{', '[')):
-                    fields = ['<JSON body>']
-                else:
-                    fields = re.findall(r'(?:^|&)([^=&]+)=', pd['text'])
-            flags = []
-            fset = ' '.join(fields)
-            if '__CALLBACKID' in fset:
-                flags.append('DevExpress callback')
-            if '__VIEWSTATE' in fset:
-                flags.append('WebForms postback')
-            if 'json' in ctype or fields == ['<JSON body>']:
-                flags.append('JSON API (possible SPA)')
-            if re.search(r'(user|login|senha|pass|pwd|email|utilizador)',
-                         fset, re.I):
-                flags.append('** possible LOGIN **')
-            posts.append((method, u.path, status, ctype, flags, fields[:12]))
-
-        if method == 'GET' and 'html' not in mime and \
-                (xrw or dest == 'empty') and \
-                not any(t in mime for t in ('image', 'font', 'css')):
-            q = u.path + (('?' + u.query) if u.query else '')
-            xhr_get.append((q, status, mime))
-
-    print('=== HTML DOCUMENTS (candidates for INJECTED URIs) ===', file=out)
-    for p, s, l in _dedup(html_docs):
-        note = '  [!] empty body in HAR' if l == 0 else f'  ({l} bytes)'
-        print(f'  [{s}] {p}{note}', file=out)
-
-    if fragments:
-        print('\n=== HTML FRAGMENTS via XHR (do NOT inject) ===', file=out)
-        for p, s in _dedup(fragments):
-            print(f'  [{s}] {p}', file=out)
-
-    print('\n=== POST/PUT/DELETE (candidates for VALIDATED URIs) ===',
-          file=out)
-    for m, p, s, c, fl, fi in posts:
-        print(f'  [{s}] {m} {p}  ct={c}  {" | ".join(fl)}', file=out)
-        if fi:
-            print(f'        fields: {fi}', file=out)
-
-    if xhr_get:
-        print('\n=== XHR/API GET (context) ===', file=out)
-        for p, s, mm in _dedup(xhr_get):
-            print(f'  [{s}] {p}  ({mm})', file=out)
-
-    if redirects:
-        print('\n=== REDIRECTS (check for case variants) ===', file=out)
-        for s, p, loc in _dedup(redirects, key=lambda x: (x[1], x[2])):
-            print(f'  [{s}] {p} -> {loc}', file=out)
-
-    print('\n=== SCRIPTS REFERENCED IN HTML (sensor detection) ===', file=out)
-    sensor_found = False
-    for page, src in _dedup(scripts, key=lambda x: x[1]):
-        mark = ''
-        if KNOWN_SENSORS.search(src):
-            mark = '   <<< ANTI-BOT SENSOR DETECTED'
-            sensor_found = True
-        print(f'  {src}   (in {page}){mark}', file=out)
-    print(('\n  RESULT: an anti-bot sensor IS present in the captured pages.'
-           if sensor_found else
-           '\n  RESULT: NO known anti-bot sensor was detected in the '
-           'captured pages.'), file=out)
-
-    if form_actions:
-        print('\n=== FRAMEWORK HINTS ===', file=out)
-        for f in sorted(form_actions):
-            print(f'  {f}', file=out)
 
 
 # --------------------------------------------------------------------------
@@ -262,50 +340,37 @@ def analyze(har: dict, host: str | None, out) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description='Sanitize a HAR capture and check the CloudGuard WAF '
-                    'Anti-Bot configuration.')
+        description='Find the CloudGuard WAF Anti-Bot Injected and Validated '
+                    'URIs in a HAR capture of a login.')
     ap.add_argument('har', help='HAR file exported from the browser')
-    ap.add_argument('--host',
-                    help='host to analyze (default: the most frequent one)')
+    ap.add_argument('--sanitize', action='store_true',
+                    help='also write <name>.SANITIZED.har, safe to share')
     args = ap.parse_args()
 
     src = Path(args.har)
-    if not src.exists():
-        print(f'ERROR: file not found: {src}', file=sys.stderr)
-        return 1
-
     try:
         with open(src, encoding='utf-8-sig') as f:
             har = json.load(f)
-        har['log']['entries']
-    except (json.JSONDecodeError, KeyError, TypeError):
-        print('ERROR: this does not look like a valid HAR file. '
-              'Please re-export it from the browser (see README).',
-              file=sys.stderr)
+        for e in har['log']['entries']:
+            e['request']['url']
+    except OSError as exc:
+        print(f'ERROR: cannot read {src}: {exc}', file=sys.stderr)
+        return 1
+    except (ValueError, KeyError, TypeError):
+        print('ERROR: this is not a valid HAR file. Export it again from the '
+              'browser (see README).', file=sys.stderr)
         return 1
 
-    # 1) Sanitize — always first
-    stats = sanitize(har)
-    sanitized_path = src.parent / (src.stem + '.SANITIZED.har')
-    with open(sanitized_path, 'w', encoding='utf-8') as f:
-        json.dump(har, f, ensure_ascii=False)
+    injected, validated, reason = find_uris(har)
+    print(report(injected, validated, reason))
 
-    # 2) Analyze the sanitized copy and write the report
-    report_path = src.parent / (src.stem + '.REPORT.txt')
-    with open(report_path, 'w', encoding='utf-8') as f:
-        analyze(har, args.host, f)
-
-    # Console summary
-    print('Done.\n')
-    print('Sanitization summary (redacted items):')
-    for k, v in stats.items():
-        print(f'  {k}: {v}')
-    print(f'\nFiles created:')
-    print(f'  {sanitized_path}')
-    print(f'  {report_path}')
-    print('\nSend BOTH files to your security contact. '
-          'Do NOT send the original .har file.')
-    return 0
+    if args.sanitize:
+        sanitize(har)
+        out = src.parent / (src.stem + '.SANITIZED.har')
+        with open(out, 'w', encoding='utf-8') as f:
+            json.dump(har, f, ensure_ascii=False)
+        print(f'\nSanitized copy: {out}')
+    return 2 if reason else 0
 
 
 if __name__ == '__main__':
