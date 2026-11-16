@@ -105,10 +105,11 @@ python3 antibot_check.py capture.har --sanitize
 
 The tool also writes `capture.SANITIZED.har`, which is safe to share. **Never share the original capture**: it contains session cookies and credentials.
 
-The sanitized copy keeps only what the analysis needs (field names, paths and the structure of the forms), so it gives the same result. It removes:
+The sanitized copy keeps only what the analysis needs (field names, paths and the structure of the forms), so it gives the same result (unless a login path itself contains an email or a token, which is then shown as `[REDACTED]`). It removes:
 
 - all cookies, and authorization, API-key, CSRF, session and other token headers;
 - every query-string and URL-fragment value, in URLs, redirects and `Referer`/`Location`/`:path` headers;
+- emails and JWTs that appear in URL paths (e.g. `/users/ana@example.com/edit`, password-reset links) and in page titles;
 - every value submitted in forms, JSON and multipart bodies;
 - page text, scripts and hidden-field values from HTML responses, and every other response body;
 - WebSocket messages and browser call stacks.

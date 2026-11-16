@@ -212,6 +212,16 @@ URL_HEADERS = {'referer', 'location', 'content-location', 'refresh',
 
 REDACTED = '[REDACTED]'
 
+# Personal data and credentials that some apps put in the URL *path*, where
+# _redact_query does not look: emails (e.g. /kc/user@example.com/clients,
+# also URL-encoded as %40) and JWTs (magic links, password reset links).
+_EMAIL_RE = re.compile(r'[A-Za-z0-9._%+-]+(?:@|%40)[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+_JWT_RE = re.compile(r'eyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*')
+
+
+def _redact_path(path: str) -> str:
+    return _JWT_RE.sub(REDACTED, _EMAIL_RE.sub(REDACTED, path))
+
 
 def _redact_query(qs: str) -> str:
     """Keep parameter names, redact every value."""
@@ -224,15 +234,19 @@ def _redact_query(qs: str) -> str:
 
 
 def _redact_url(url: str) -> str:
-    """Redact query-string and fragment values, keep scheme/host/path."""
+    """Redact query-string and fragment values, and emails/JWTs in the path;
+    keep scheme, host and the rest of the path."""
     try:
         u = urlparse(url)
     except ValueError:
         return REDACTED
-    if not (u.query or u.fragment or u.username or u.password):
+    path = _redact_path(u.path)
+    if not (u.query or u.fragment or u.username or u.password) and \
+            path == u.path:
         return url
     netloc = u.netloc.rsplit('@', 1)[-1]
-    return urlunparse(u._replace(netloc=netloc, query=_redact_query(u.query),
+    return urlunparse(u._replace(netloc=netloc, path=path,
+                                 query=_redact_query(u.query),
                                  fragment=_redact_query(u.fragment)))
 
 
@@ -293,8 +307,13 @@ def sanitize(har: dict) -> None:
     """Redact sensitive data in place. Field names, paths and form structure
     are kept, so the sanitized copy gives the same result."""
     for page in har['log'].get('pages', []):
-        if '://' in page.get('title', ''):
-            page['title'] = _redact_url(page['title'])
+        title = page.get('title')
+        if not title:
+            continue
+        # The browser sets the title to the page URL, or to the document
+        # title, which can show the signed-in user (e.g. "Inbox - ana@...")
+        page['title'] = _redact_url(title) if '://' in title else \
+            _redact_path(title)
 
     for entry in har['log']['entries']:
         req, resp = entry.get('request', {}), entry.get('response', {})

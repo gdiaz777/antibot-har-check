@@ -196,6 +196,49 @@ class SanitizeTest(unittest.TestCase):
         self.assertEqual(ac.find_uris(har), before)
 
 
+class SanitizeUrlPathTest(unittest.TestCase):
+    """Emails and JWTs in URL paths, plus the leaks fixed on 2026-08-27
+    (fragment params, initiator, redirects, JSON token replies)."""
+    JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbmEifQ.c2lnbmF0dXJl'
+
+    def har(self):
+        e1 = _entry('GET', 'https://sso.example.com/kc/ana.garcia@example.com/clients',
+                    reqh=_h(referer='https://app.example.com/users/bob%40example.org/edit'),
+                    resph=_h(location='/reset/' + self.JWT + '/confirm'))
+        e2 = _entry('GET', 'https://app.example.com/#/callback&code=SPACODE&state=xyz',
+                    status=302)
+        e2['response']['redirectURL'] = 'https://app.example.com/done?code=REDIRCODE'
+        e2['_initiator'] = {'type': 'script', 'url': 'https://app.example.com/a.js?t=INITTOKEN'}
+        e3 = _entry('POST', 'https://idp.example.com/oauth/token', mime='application/json',
+                    text='{"access_token": "JSONTOKEN", "token_type": "Bearer"}')
+        e4 = _entry('GET', 'https://app.example.com/login', text=(
+            '<form action="/u/carlos@example.net/session" method="post">'
+            '<input name="username"><input type="password" name="password"></form>'))
+        e5 = _entry('GET', 'https://app.example.com/api/v2/users/123/profile', mime='application/json')
+        return {'log': {'pages': [{'id': 'p1', 'title': 'Bandeja de entrada - dora@example.com'},
+                                  {'id': 'p2', 'title': 'https://app.example.com/me/eve@example.com?x=1'},
+                                  {'id': 'p3'}],
+                        'entries': [e1, e2, e3, e4, e5]}}
+
+    def test_no_email_jwt_or_token_survives(self):
+        har = self.har()
+        ac.sanitize(har)
+        dump = json.dumps(har)
+        leaks = [s for s in ('ana.garcia', 'bob%40example', 'carlos@', 'dora@', 'eve@',
+                             self.JWT, 'eyJzdWIi', 'SPACODE', 'REDIRCODE', 'INITTOKEN',
+                             'JSONTOKEN') if s in dump]
+        self.assertEqual(leaks, [])
+
+    def test_rest_of_the_url_is_kept(self):
+        har = self.har()
+        ac.sanitize(har)
+        e = har['log']['entries']
+        self.assertEqual(e[0]['request']['url'], 'https://sso.example.com/kc/[REDACTED]/clients')
+        self.assertEqual(ac._header(e[0]['response'], 'location'), '/reset/[REDACTED]/confirm')
+        self.assertEqual(e[4]['request']['url'], 'https://app.example.com/api/v2/users/123/profile')
+        self.assertNotIn('title', har['log']['pages'][2], 'no se inventa un título')
+
+
 class CliTest(unittest.TestCase):
     def run_cli(self, har, *args):
         d = tempfile.mkdtemp()
